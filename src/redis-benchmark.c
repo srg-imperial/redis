@@ -49,6 +49,11 @@
 #define UNUSED(V) ((void) V)
 #define RANDPTR_INITIAL_SIZE 8
 
+struct multiTestArg {
+    const char * test;
+    int percent;
+};
+
 static struct config {
     aeEventLoop *el;
     const char *hostip;
@@ -77,6 +82,7 @@ static struct config {
     int dbnum;
     sds dbnumstr;
     char *tests;
+    struct multiTestArg multi[16];
     char *auth;
 } config;
 
@@ -123,9 +129,11 @@ static long long mstime(void) {
 
 static void freeClient(client c) {
     listNode *ln;
-    aeDeleteFileEvent(config.el,c->context->fd,AE_WRITABLE);
-    aeDeleteFileEvent(config.el,c->context->fd,AE_READABLE);
-    redisFree(c->context);
+    if (c->context) {
+        aeDeleteFileEvent(config.el,c->context->fd,AE_WRITABLE);
+        aeDeleteFileEvent(config.el,c->context->fd,AE_READABLE);
+        redisFree(c->context);
+    }
     sdsfree(c->obuf);
     zfree(c->randptr);
     zfree(c);
@@ -165,6 +173,149 @@ static void randomizeClientKey(client c) {
             *p = '0'+r%10;
             r/=10;
             p--;
+        }
+    }
+}
+
+struct clients {
+    client   master;
+    client * others;
+    int      n_clients;
+    int      active;
+    client   random[100];
+};
+
+static void freeClients(struct clients * clients) {
+    freeClient(clients->master);
+
+    for (int i = 0 ; i < clients->n_clients ; i++) {
+        clients->others[i]-> context = NULL;
+        freeClient(clients->others[i]);
+    }
+
+    free(clients);
+}
+
+static void multiWriteHandler(aeEventLoop *el, int fd, void *privdata, int mask);
+
+static void clientsDone(struct clients * clients) {
+    if (config.requests_finished == config.requests) {
+        freeClients(clients);
+        aeStop(config.el);
+        return;
+    }
+    assert(config.keepalive);
+
+    // Reset client
+    {
+        client c = clients->random[clients->active];
+        aeDeleteFileEvent(config.el,c->context->fd,AE_WRITABLE);
+        aeDeleteFileEvent(config.el,c->context->fd,AE_READABLE);
+        aeCreateFileEvent(config.el,c->context->fd,AE_WRITABLE,multiWriteHandler,clients);
+        c->written = 0;
+        c->pending = config.pipeline;
+    }
+
+    clients->active = (clients->active + 1) % 100;
+}
+
+static void multiReadHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
+    struct clients * clients = privdata;
+    client c = clients->random[clients->active];
+    void *reply = NULL;
+    UNUSED(el);
+    UNUSED(fd);
+    UNUSED(mask);
+
+    /* Calculate latency only for the first read event. This means that the
+     * server already sent the reply and we need to parse it. Parsing overhead
+     * is not part of the latency, so calculate it only once, here. */
+    if (c->latency < 0) c->latency = ustime()-(c->start);
+
+    if (redisBufferRead(c->context) != REDIS_OK) {
+        fprintf(stderr,"Error: %s\n",c->context->errstr);
+        exit(1);
+    } else {
+        while(c->pending) {
+            if (redisGetReply(c->context,&reply) != REDIS_OK) {
+                fprintf(stderr,"Error: %s\n",c->context->errstr);
+                exit(1);
+            }
+            if (reply != NULL) {
+                if (reply == (void*)REDIS_REPLY_ERROR) {
+                    fprintf(stderr,"Unexpected error reply, exiting...\n");
+                    exit(1);
+                }
+
+                freeReplyObject(reply);
+                /* This is an OK for prefix commands such as auth and select.*/
+                if (c->prefix_pending > 0) {
+                    c->prefix_pending--;
+                    c->pending--;
+                    /* Discard prefix commands on first response.*/
+                    if (c->prefixlen > 0) {
+                        size_t j;
+                        sdsrange(c->obuf, c->prefixlen, -1);
+                        /* We also need to fix the pointers to the strings
+                        * we need to randomize. */
+                        for (j = 0; j < c->randlen; j++)
+                            c->randptr[j] -= c->prefixlen;
+                        c->prefixlen = 0;
+                    }
+                    continue;
+                }
+
+                if (config.requests_finished < config.requests)
+                    config.latency[config.requests_finished++] = c->latency;
+                c->pending--;
+                if (c->pending == 0) {
+                    clientsDone(clients);
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask);
+
+static void multiWriteHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
+    struct clients * clients = privdata;
+    client c = clients->random[clients->active];
+
+    UNUSED(el);
+    UNUSED(fd);
+    UNUSED(mask);
+
+    /* Initialize request when nothing was written. */
+    if (c->written == 0) {
+        /* Enforce upper bound to number of requests. */
+        if (config.requests_issued++ >= config.requests) {
+            freeClients(clients);
+            return;
+        }
+
+        /* Really initialize: randomize keys and set start time. */
+        if (config.randomkeys) randomizeClientKey(c);
+        c->start = ustime();
+        c->latency = -1;
+    }
+
+    if (sdslen(c->obuf) > c->written) {
+        void *ptr = c->obuf+c->written;
+        ssize_t nwritten = write(c->context->fd,ptr,sdslen(c->obuf)-c->written);
+        if (nwritten == -1) {
+            if (errno != EPIPE)
+                fprintf(stderr, "Writing to socket: %s\n", strerror(errno));
+            freeClients(clients);
+            return;
+        }
+        c->written += nwritten;
+        if (sdslen(c->obuf) == c->written) {
+            aeDeleteFileEvent(config.el,c->context->fd,AE_WRITABLE);
+            aeCreateFileEvent(config.el,c->context->fd,AE_READABLE,multiReadHandler,clients);
         }
     }
 }
@@ -302,25 +453,29 @@ static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
  *    for arguments randomization.
  *
  * Even when cloning another client, prefix commands are applied if needed.*/
-static client createClient(char *cmd, size_t len, client from) {
+static client createClient(bool connect, char *cmd, size_t len, client from) {
     int j;
     client c = zmalloc(sizeof(struct _client));
 
-    if (config.hostsocket == NULL) {
-        c->context = redisConnectNonBlock(config.hostip,config.hostport);
+    if (connect) {
+        if (config.hostsocket == NULL) {
+            c->context = redisConnectNonBlock(config.hostip,config.hostport);
+        } else {
+            c->context = redisConnectUnixNonBlock(config.hostsocket);
+        }
+        if (c->context->err) {
+            fprintf(stderr,"Could not connect to Redis at ");
+            if (config.hostsocket == NULL)
+                fprintf(stderr,"%s:%d: %s\n",config.hostip,config.hostport,c->context->errstr);
+            else
+                fprintf(stderr,"%s: %s\n",config.hostsocket,c->context->errstr);
+            exit(1);
+        }
+        /* Suppress hiredis cleanup of unused buffers for max speed. */
+        c->context->reader->maxbuf = 0;
     } else {
-        c->context = redisConnectUnixNonBlock(config.hostsocket);
+        c->context = NULL;
     }
-    if (c->context->err) {
-        fprintf(stderr,"Could not connect to Redis at ");
-        if (config.hostsocket == NULL)
-            fprintf(stderr,"%s:%d: %s\n",config.hostip,config.hostport,c->context->errstr);
-        else
-            fprintf(stderr,"%s: %s\n",config.hostsocket,c->context->errstr);
-        exit(1);
-    }
-    /* Suppress hiredis cleanup of unused buffers for max speed. */
-    c->context->reader->maxbuf = 0;
 
     /* Build the request buffer:
      * Queue N requests accordingly to the pipeline size, or simply clone
@@ -392,18 +547,95 @@ static client createClient(char *cmd, size_t len, client from) {
             }
         }
     }
-    if (config.idlemode == 0)
+    if (connect && config.idlemode == 0)
         aeCreateFileEvent(config.el,c->context->fd,AE_WRITABLE,writeHandler,c);
     listAddNodeTail(config.clients,c);
     config.liveclients++;
     return c;
 }
 
+/* http://stackoverflow.com/a/10072899 */
+static void shuffle(client * array, size_t n) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    int usec = tv.tv_usec;
+    srand48(usec);
+
+    if (n > 1) {
+        size_t i;
+        for (i = n - 1; i > 0; i--) {
+            size_t j = (unsigned int) (drand48()*(i+1));
+            client t = array[j];
+            array[j] = array[i];
+            array[i] = t;
+        }
+    }
+}
+
+static struct clients * createMultiClient(char **cmd, size_t * len, int * pc, int n_cmd) {
+    struct clients * clients = malloc(sizeof(struct clients));
+    clients->master = malloc(sizeof(struct _client));
+    clients->others = malloc(n_cmd * sizeof(struct _client));
+    clients->n_clients = n_cmd;
+
+    // Unsupported config options
+    assert(config.auth == NULL);
+    assert(config.dbnum == 0);
+
+    clients->master = createClient(false,"PING\r\n",6, NULL);
+    clients->active = 0;
+
+    {
+        client c = clients->master;
+        if (config.hostsocket == NULL) {
+            c->context = redisConnectNonBlock(config.hostip,config.hostport);
+        } else {
+            c->context = redisConnectUnixNonBlock(config.hostsocket);
+        }
+        if (c->context->err) {
+            fprintf(stderr,"Could not connect to Redis at ");
+            if (config.hostsocket == NULL)
+                fprintf(stderr,"%s:%d: %s\n",config.hostip,config.hostport,c->context->errstr);
+            else
+                fprintf(stderr,"%s: %s\n",config.hostsocket,c->context->errstr);
+            exit(1);
+        }
+        /* Suppress hiredis cleanup of unused buffers for max speed. */
+        c->context->reader->maxbuf = 0;
+    }
+
+    // Master does any preffix operations
+    char *auth = config.auth;
+    int  dbnum = config.dbnum;
+
+    config.auth  = NULL;
+    config.dbnum = 0;
+
+    int k = 0;
+    for (int i = 0 ; i < n_cmd ; i++) {
+        clients->others[i] = createClient(false, cmd[i], len[i], NULL);
+        clients->others[i]->context = clients->master->context;
+        for (int j = 0 ; j < pc[i] ; j++ , k++)
+            clients->random[k] = clients->others[i];
+    }
+
+    shuffle(clients->random, 100);
+
+    config.auth =  auth;
+    config.dbnum = dbnum;
+
+    assert(config.idlemode == 0);
+    aeCreateFileEvent(config.el,clients->master->context->fd,AE_WRITABLE,multiWriteHandler,clients);
+
+    return clients;
+}
+
+
 static void createMissingClients(client c) {
     int n = 0;
 
     while(config.liveclients < config.numclients) {
-        createClient(NULL,0,c);
+        createClient(true, NULL,0,c);
 
         /* Listen backlog is quite limited on most systems */
         if (++n > 64) {
@@ -454,7 +686,7 @@ static void benchmark(char *title, char *cmd, int len) {
     config.requests_issued = 0;
     config.requests_finished = 0;
 
-    c = createClient(cmd,len,NULL);
+    c = createClient(true, cmd,len,NULL);
     createMissingClients(c);
 
     config.start = mstime();
@@ -464,6 +696,32 @@ static void benchmark(char *title, char *cmd, int len) {
     showLatencyReport();
     freeAllClients();
 }
+
+static void multiBenchmark(char *title, char **cmd, size_t *len, int * pc, int n_cmd) {
+    config.title = title;
+    config.requests_issued = 0;
+    config.requests_finished = 0;
+
+    {
+        int n = 0;
+        while (config.liveclients < config.numclients) {
+            createMultiClient(cmd,len,pc,n_cmd);
+
+            /* Listen backlog is quite limited on most systems */
+            if (++n > 64) {
+                usleep(50000);
+                n = 0;
+            }
+        }
+    }
+
+    config.start = mstime();
+    aeMain(config.el);
+    config.totlatency = mstime()-config.start;
+
+    showLatencyReport();
+}
+
 
 /* Returns number of consumed options. */
 int parseOptions(int argc, const char **argv) {
@@ -529,6 +787,22 @@ int parseOptions(int argc, const char **argv) {
             config.tests = sdscat(config.tests,(char*)argv[++i]);
             config.tests = sdscat(config.tests,",");
             sdstolower(config.tests);
+        } else if (!strcmp(argv[i],"-T")) {
+            if (lastarg) goto invalid;
+            /* We get the list of tests to run as a string in the form
+             * get,set,lrange,...,test_N. Then we add a comma before and
+             * after the string in order to make sure that searching
+             * for ",testname," will always get a match if the test is
+             * enabled. */
+            struct multiTestArg * multi = NULL;
+            for (size_t j = 0 ; j < sizeof(config.multi)/sizeof(*multi) ; j++) {
+                if (config.multi[j].test == NULL) {
+                    multi = config.multi + j;
+                    break;
+                }
+            }
+            assert(multi != NULL); // More than 16 -T arguments
+            multi->test = argv[++i];
         } else if (!strcmp(argv[i],"--dbnum")) {
             if (lastarg) goto invalid;
             config.dbnum = atoi(argv[++i]);
@@ -574,6 +848,7 @@ usage:
 " -l                 Loop. Run the tests forever\n"
 " -t <tests>         Only run the comma separated list of tests. The test\n"
 "                    names are the same as the ones produced as output.\n"
+" -T <test:percent>  Run a mix of GET/SET operations with the specified percentage.\n"
 " -I                 Idle mode. Just open N idle connections and wait.\n\n"
 "Examples:\n\n"
 " Run the benchmark with the default configuration against 127.0.0.1:6379:\n"
@@ -584,6 +859,8 @@ usage:
 "   $ redis-benchmark -t set -n 1000000 -r 100000000\n\n"
 " Benchmark 127.0.0.1:6379 for a few commands producing CSV output:\n"
 "   $ redis-benchmark -t ping,set,get -n 100000 --csv\n\n"
+" Benchmark a workload of 99\% GET and 1\% SET :\n"
+"   $ redis-benchmark -n 10000 -T get:99 -T set:1\n\n"
 " Benchmark a specific command line:\n"
 "   $ redis-benchmark -r 10000 -n 10000 eval 'return redis.call(\"ping\")' 0\n\n"
 " Fill a list with 10000 random elements:\n"
@@ -664,6 +941,10 @@ int main(int argc, const char **argv) {
     config.dbnum = 0;
     config.auth = NULL;
 
+    for (size_t j = 0 ; j < sizeof(config.multi) / sizeof(*config.multi) ; j++) {
+        config.multi[j].test = NULL;
+    }
+
     i = parseOptions(argc,argv);
     argc -= i;
     argv += i;
@@ -676,7 +957,7 @@ int main(int argc, const char **argv) {
 
     if (config.idlemode) {
         printf("Creating %d idle connections and waiting forever (Ctrl+C when done)\n", config.numclients);
-        c = createClient("",0,NULL); /* will never receive a reply */
+        c = createClient(true, "",0,NULL); /* will never receive a reply */
         createMissingClients(c);
         aeMain(config.el);
         /* and will wait for every */
@@ -704,6 +985,60 @@ int main(int argc, const char **argv) {
     do {
         memset(data,'x',config.datasize);
         data[config.datasize] = '\0';
+
+        if (config.multi[0].test != NULL) {
+
+            int n_cmd;
+            int total = 0;
+            for (size_t i = 0 ; i < sizeof(config.multi)/sizeof(*config.multi) ; i++) {
+                struct multiTestArg * multi = config.multi + i;
+
+                if (multi->test == NULL) {
+                    n_cmd = i;
+                    break;
+                }
+
+                int count;
+                sds * toks = sdssplitlen(multi->test, strlen(multi->test),
+                                         ":", 1, &count);
+
+                assert(count == 2);
+
+                multi->percent = atoi(toks[1]);
+                total += multi->percent;
+
+                sdsfreesplitres(toks, count);
+            }
+
+            assert(total == 100);
+
+            size_t * len = malloc(n_cmd * sizeof(size_t));
+            int    *  pc = malloc(n_cmd * sizeof(int));
+            char ** cmds = malloc(n_cmd * sizeof(char*));
+
+            for (int i = 0 ; i < n_cmd ; i++) {
+                struct multiTestArg * multi = config.multi + i;
+
+                if (strstr(multi->test, "get") == multi->test) {
+                    len[i] = redisFormatCommand(cmds+i, "GET key:__rand_int__");
+                } else if (strstr(multi->test, "set") == multi->test) {
+                    len[i] = redisFormatCommand(cmds+i, "SET key:__rand_int__ %s",data);
+                } else {
+                    printf("Unsupported multi test: %s\n", multi->test);
+                    exit(1);
+                }
+
+                pc[i] = multi->percent;
+            }
+
+            multiBenchmark("MULTI", cmds, len, pc, n_cmd);
+            for (int i = 0 ; i < n_cmd ; i++)
+                free(cmds[i]);
+            free(cmds);
+            free(len);
+            free(pc);
+            continue;
+        }
 
         if (test_is_selected("ping_inline") || test_is_selected("ping"))
             benchmark("PING_INLINE","PING\r\n",6);
