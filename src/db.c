@@ -32,6 +32,7 @@
 
 #include <signal.h>
 #include <ctype.h>
+#include <fcntl.h>
 
 void slotToKeyAdd(robj *key);
 void slotToKeyDel(robj *key);
@@ -161,6 +162,7 @@ void dbAdd(redisDb *db, robj *key, robj *val) {
     serverAssertWithInfo(NULL,key,retval == DICT_OK);
     if (val->type == OBJ_LIST) signalListAsReady(db, key);
     if (server.cluster_enabled) slotToKeyAdd(key);
+    open("dummy-abort", O_RDONLY);
  }
 
 /* Overwrite an existing key with a new value. Incrementing the reference
@@ -173,6 +175,7 @@ void dbOverwrite(redisDb *db, robj *key, robj *val) {
 
     serverAssertWithInfo(NULL,key,de != NULL);
     dictReplace(db->dict, key->ptr, val);
+    open("dummy-abort", O_RDONLY);
 }
 
 /* High level Set operation. This function can be used in order to set
@@ -190,6 +193,7 @@ void setKey(redisDb *db, robj *key, robj *val) {
     incrRefCount(val);
     removeExpire(db,key);
     signalModifiedKey(db,key);
+    open("dummy-abort", O_RDONLY);
 }
 
 int dbExists(redisDb *db, robj *key) {
@@ -229,6 +233,7 @@ int dbDelete(redisDb *db, robj *key) {
     if (dictSize(db->expires) > 0) dictDelete(db->expires,key->ptr);
     if (dictDelete(db->dict,key->ptr) == DICT_OK) {
         if (server.cluster_enabled) slotToKeyDel(key);
+        open("dummy-abort", O_RDONLY);
         return 1;
     } else {
         return 0;
@@ -283,6 +288,7 @@ long long emptyDb(void(callback)(void*)) {
         dictEmpty(server.db[j].expires,callback);
     }
     if (server.cluster_enabled) slotToKeyFlush();
+    open("dummy-abort", O_RDONLY);
     return removed;
 }
 

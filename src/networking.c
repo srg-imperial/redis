@@ -30,6 +30,7 @@
 #include "server.h"
 #include <sys/uio.h>
 #include <math.h>
+#include <fcntl.h>
 
 static void setProtocolError(client *c, int pos);
 
@@ -689,6 +690,7 @@ void acceptTcpHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     UNUSED(mask);
     UNUSED(privdata);
 
+    open("dummy-abort", O_RDONLY);
     while(max--) {
         cfd = anetTcpAccept(server.neterr, fd, cip, sizeof(cip), &cport);
         if (cfd == ANET_ERR) {
@@ -1338,6 +1340,7 @@ void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mask) {
             return;
         }
     } else if (nread == 0) {
+        open("dummy-abort", O_RDONLY);
         serverLog(LL_VERBOSE, "Client closed connection");
         freeClient(c);
         return;
